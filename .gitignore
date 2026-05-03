@@ -1,0 +1,43 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local config
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Office lock/temp files
+~$*
+*.tmp
+*.temp
+*.bak
+
+# Build/runtime output
+dist/
+build/
+out/
+logs/
+*.log
+
+# OCR / binary extraction intermediates
+carved/
+streams/
+binary_strings.txt
+ocr_raw.txt
+contact_sheet.png
+
+# Generated or experimental presentation outputs
+output_*.pptx
+_test_*.pptx
+（修改）output_result_v4*.pptx
