@@ -29,6 +29,7 @@ build/
 out/
 logs/
 *.log
+audio_cache/
 
 # OCR / binary extraction intermediates
 carved/

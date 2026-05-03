@@ -10,12 +10,15 @@ PPT Maker (工业级克隆协议版)
 - 分页逻辑：不在同一页叠加内容；每个单词=复制整张模板 Slide 2 -> 在新页上替换。
 - 总起页：基于模板 Slide 1；按素材意项数 N 动态克隆/隐藏 SUB_ITEM_UNIT_X 组并更新序号与标题。
 - 总结页：基于模板 Slide 3；按 N 网格克隆 SUMMARY_UNIT_TEMPLATE 组并填充。
+- 发音按钮例外：详情页可追加“英/美”动作声音按钮，不修改模板，仅写入输出 PPT。
 - AI 绘图预留：识别 PLACEHOLDER_AI_IMAGE，控制台打印该单词的 DALL·E 3 英文提示词。
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from copy import deepcopy
@@ -27,18 +30,49 @@ import json
 import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import asdict
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+from xml.sax.saxutils import escape
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.enum.text import MSO_AUTO_SIZE
-from pptx.oxml.ns import qn
+from pptx.media import Video
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.oxml import parse_xml
+from pptx.oxml.ns import nsdecls, qn
 from pptx.util import Pt
 
 
 TEMPLATE_PPTX = "master_template.pptx"
 CONTENT_TXT = "content.txt"
 OUTPUT_DEFAULT = "output_result.pptx"
+AUDIO_CACHE_DIR = "audio_cache"
+FFMPEG_CANDIDATES = (
+    "ffmpeg",
+    r"E:\downloads in E\SudaCaplayer\bin\Converter\x64\ffmpeg.exe",
+    r"E:\downloads in E\SudaCaplayer\bin\Converter\ffmpeg.exe",
+)
+
+AUDIO_VARIANTS = (
+    {
+        "key": "uk",
+        "label": "英",
+        "culture": "en-GB",
+        "youdao_type": "1",
+        "language_lcids": {"809", "0809"},
+        "accent_rgb": (21, 94, 239),
+    },
+    {
+        "key": "us",
+        "label": "美",
+        "culture": "en-US",
+        "youdao_type": "0",
+        "language_lcids": {"409", "0409"},
+        "accent_rgb": (255, 0, 0),
+    },
+)
 
 
 def _safe_stdout_utf8() -> None:
@@ -46,6 +80,191 @@ def _safe_stdout_utf8() -> None:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+
+def _safe_filename_piece(text: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9_-]+", "_", (text or "").strip().lower())
+    return s.strip("_") or "word"
+
+
+def _find_ffmpeg() -> Optional[str]:
+    for candidate in FFMPEG_CANDIDATES:
+        found = shutil.which(candidate)
+        if found:
+            return found
+        p = Path(candidate)
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _convert_mp3_to_action_wav(mp3_path: Path, wav_path: Path, warnings: set[str]) -> Optional[Path]:
+    """
+    PowerPoint action sounds are most reliable as PCM WAV. MP3 may embed, but often
+    clicks without audible playback on some Office builds.
+    """
+    if wav_path.exists() and wav_path.stat().st_size > 1024:
+        return wav_path
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        warnings.add("未找到 ffmpeg，无法把在线 MP3 转成 PowerPoint 动作声音所需的 WAV。")
+        return None
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(mp3_path),
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "22050",
+        "-ac",
+        "1",
+        str(wav_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as exc:
+        warnings.add(f"MP3 转 WAV 失败：{mp3_path.name} ({exc})")
+        return None
+    return wav_path if wav_path.exists() and wav_path.stat().st_size > 1024 else None
+
+
+def _normalize_lcid(value: str) -> str:
+    s = (value or "").strip().lower().replace("0x", "")
+    return s.lstrip("0") or s
+
+
+def _sapi_voices() -> List[Dict[str, str]]:
+    try:
+        import pythoncom  # type: ignore
+        import win32com.client  # type: ignore
+
+        pythoncom.CoInitialize()
+        speaker = win32com.client.Dispatch("SAPI.SpVoice")
+        voices: List[Dict[str, str]] = []
+        for token in speaker.GetVoices():
+            try:
+                voices.append(
+                    {
+                        "id": str(token.Id),
+                        "description": str(token.GetDescription()),
+                        "language": _normalize_lcid(str(token.GetAttribute("Language"))),
+                    }
+                )
+            except Exception:
+                continue
+        return voices
+    except Exception:
+        return []
+
+
+def _pick_sapi_voice(variant: Dict[str, object]) -> Optional[Dict[str, str]]:
+    target_lcids = {_normalize_lcid(str(x)) for x in variant["language_lcids"]}  # type: ignore[index]
+    for voice in _sapi_voices():
+        if voice.get("language") in target_lcids:
+            return voice
+    return None
+
+
+def _download_word_audio(
+    *,
+    word: str,
+    variant: Dict[str, object],
+    cache_dir: Path,
+    warnings: set[str],
+) -> Optional[Path]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = cache_dir / f"{_safe_filename_piece(word)}_{variant['key']}.mp3"
+    if audio_path.exists() and audio_path.stat().st_size > 1024:
+        return audio_path
+
+    url = f"https://dict.youdao.com/dictvoice?type={variant['youdao_type']}&audio={quote(word)}"
+    try:
+        req = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+        )
+        with urlopen(req, timeout=15) as resp:
+            data = resp.read()
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+        if len(data) <= 1024 or "audio" not in content_type:
+            warnings.add(f"{variant['culture']} 在线发音返回内容异常，将尝试本地系统语音兜底。")
+            return None
+        audio_path.write_bytes(data)
+        return audio_path
+    except Exception:
+        warnings.add(f"{variant['culture']} 在线发音下载失败，将尝试本地系统语音兜底。")
+        return None
+
+
+def _synthesize_word_audio(
+    *,
+    word: str,
+    variant: Dict[str, object],
+    cache_dir: Path,
+    warnings: set[str],
+) -> Optional[Path]:
+    """
+    Generate one pronunciation wav using local Windows SAPI voices.
+    If the requested accent voice is not installed, skip it instead of faking the accent.
+    """
+    voice_info = _pick_sapi_voice(variant)
+    culture = str(variant["culture"])
+    if voice_info is None:
+        warnings.add(f"未找到 {culture} 系统语音，已跳过 {variant['label']} 发音按钮。")
+        return None
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = cache_dir / f"{_safe_filename_piece(word)}_{variant['key']}.wav"
+    if audio_path.exists() and audio_path.stat().st_size > 1024:
+        return audio_path
+
+    try:
+        import pythoncom  # type: ignore
+        import win32com.client  # type: ignore
+
+        pythoncom.CoInitialize()
+        speaker = win32com.client.Dispatch("SAPI.SpVoice")
+        for token in speaker.GetVoices():
+            if str(token.Id) == voice_info["id"]:
+                speaker.Voice = token
+                break
+
+        stream = win32com.client.Dispatch("SAPI.SpFileStream")
+        # 3 = SSFMCreateForWrite. Keeping the numeric constant avoids requiring makepy.
+        stream.Open(str(audio_path), 3, False)
+        speaker.AudioOutputStream = stream
+        speaker.Rate = -1
+        speaker.Volume = 100
+        speaker.Speak(word)
+        stream.Close()
+        return audio_path if audio_path.exists() and audio_path.stat().st_size > 1024 else None
+    except Exception as exc:
+        warnings.add(f"{culture} 发音音频生成失败：{word} ({exc})")
+        return None
+
+
+def _get_word_audio(
+    *,
+    word: str,
+    variant: Dict[str, object],
+    cache_dir: Path,
+    warnings: set[str],
+) -> Optional[Path]:
+    mp3_path = _download_word_audio(word=word, variant=variant, cache_dir=cache_dir, warnings=warnings)
+    if mp3_path is not None:
+        wav_path = mp3_path.with_suffix(".wav")
+        converted = _convert_mp3_to_action_wav(mp3_path, wav_path, warnings)
+        if converted is not None:
+            return converted
+    return _synthesize_word_audio(word=word, variant=variant, cache_dir=cache_dir, warnings=warnings)
 
 
 @dataclass
@@ -83,13 +302,25 @@ _CIRCLED_NUMS = set("①②③④⑤⑥⑦⑧⑨")
 
 
 def _normalize_top_category(raw: str) -> str:
-    s = (raw or "").strip()
+    s = (raw or "").strip().lstrip("\ufeff")
     if not s:
         return s
     s = _RE_TOP_CATEGORY_PREFIX.sub("", s).strip()
     s = _RE_TOP_LESSON_PREFIX.sub("", s).strip()
     s = _RE_TOP_NUMBER_PREFIX.sub("", s).strip()
     return s.rstrip("：:").strip()
+
+
+def _compact_top_category_for_corner(normalized: str) -> str:
+    """
+    The small top-left corner label should identify the letter course only,
+    e.g. "字母b--树干" -> "B", while root/body titles keep full meaning text.
+    """
+    s = (normalized or "").strip()
+    m = re.match(r"^字母\s*([A-Za-z])", s)
+    if m:
+        return m.group(1).upper()
+    return s
 
 
 def _is_heading_line(line: str) -> bool:
@@ -205,12 +436,13 @@ def parse_content_to_tree(text: str) -> ParsedMaterial:
             break
     if not top_category and lines:
         top_category = lines[0].strip()
-    top_category = _normalize_top_category(top_category)
+    full_top_category = _normalize_top_category(top_category)
+    top_category = _compact_top_category_for_corner(full_top_category)
 
     # 2) root_name
     # 对“字母课”优先使用顶层标题，避免被后文某个词根误覆盖
-    if top_category.startswith("字母"):
-        root_name = top_category
+    if full_top_category.startswith("字母"):
+        root_name = full_top_category
     else:
         for ln in lines:
             if "词根" in ln and ("“" in ln or "：" in ln or ":" in ln):
@@ -220,7 +452,7 @@ def parse_content_to_tree(text: str) -> ParsedMaterial:
                     break
         if not root_name:
             # fallback: 重用顶层标题
-            root_name = top_category.strip() if top_category else "ROOT"
+            root_name = full_top_category.strip() if full_top_category else "ROOT"
 
     # 3) root_logic：取第一段解释句（在 root_name 段落附近）
     for i, ln in enumerate(lines):
@@ -414,6 +646,29 @@ def _estimate_text_height_emu(text: str, *, font_pt: float, box_width_emu: int) 
     return max(line_h, logical_lines * line_h)
 
 
+def _estimate_text_width_emu(text: str, *, font_pt: float) -> int:
+    font_pt = max(12.0, float(font_pt))
+
+    def char_units(ch: str) -> float:
+        code = ord(ch)
+        if ch.isspace():
+            return 0.35
+        if "\u4e00" <= ch <= "\u9fff":
+            return 0.88
+        if ch in "，。；：、“”‘’（）()[]{}【】+-/\\|":
+            return 0.45
+        if ch in ".,;:'\"`!iIljrtf":
+            return 0.32
+        if ch.isascii():
+            return 0.55
+        if code < 0x0300 or 0x1D00 <= code <= 0x1DFF:
+            return 0.55
+        return 0.75
+
+    units = sum(char_units(ch) for ch in (text or ""))
+    return int(units * font_pt * 12700)
+
+
 def _set_text_wrap(shape, *, wrap: bool = True) -> None:
     if shape is None or not hasattr(shape, "text_frame"):
         return
@@ -536,6 +791,67 @@ def _fit_text_box_inside_card(
     _set_shape_font_size(shape, fitted_pt)
 
 
+def _arrange_word_detail_text_blocks(
+    *,
+    word_shape,
+    phonetic_box,
+    definition_box,
+    analysis_box,
+    card_shape,
+) -> None:
+    """Place long analysis above the short Chinese definition inside the word card."""
+    if definition_box is None or analysis_box is None:
+        return
+    if not all(hasattr(sh, attr) for sh in (definition_box, analysis_box) for attr in ("left", "top", "width", "height")):
+        return
+
+    gap = 180000
+    side_margin = 250000
+    bottom_margin = 300000
+
+    left = int(analysis_box.left)
+    if word_shape is not None and hasattr(word_shape, "left"):
+        left = int(word_shape.left)
+
+    if card_shape is not None and all(hasattr(card_shape, attr) for attr in ("left", "top", "width", "height")):
+        card_right = int(card_shape.left) + int(card_shape.width) - side_margin
+        card_bottom = int(card_shape.top) + int(card_shape.height) - bottom_margin
+    else:
+        card_right = max(int(analysis_box.left) + int(analysis_box.width), int(definition_box.left) + int(definition_box.width))
+        card_bottom = int(analysis_box.top) + int(analysis_box.height)
+
+    usable_width = max(int(analysis_box.width), card_right - left)
+    analysis_box.left = left
+    definition_box.left = left
+    analysis_box.width = usable_width
+    definition_box.width = usable_width
+
+    if phonetic_box is not None and hasattr(phonetic_box, "top") and hasattr(phonetic_box, "height"):
+        analysis_top = int(phonetic_box.top) + int(phonetic_box.height) + 260000
+    else:
+        analysis_top = int(definition_box.top)
+
+    definition_font = 36.0
+    definition_needed = _estimate_text_height_emu(
+        definition_box.text if hasattr(definition_box, "text") else "",
+        font_pt=definition_font,
+        box_width_emu=int(definition_box.width),
+    )
+    definition_height = max(int(definition_box.height), definition_needed + 120000)
+
+    available_analysis_height = card_bottom - analysis_top - gap - definition_height
+    if available_analysis_height < 900000:
+        # Keep the definition readable even on crowded cards, but still reserve a usable
+        # upper region for the explanatory paragraph.
+        available_analysis_height = max(650000, card_bottom - analysis_top - gap - int(definition_box.height))
+        definition_height = max(int(definition_box.height), card_bottom - analysis_top - gap - available_analysis_height)
+
+    analysis_box.top = analysis_top
+    analysis_box.height = max(650000, available_analysis_height)
+    definition_box.top = int(analysis_box.top) + int(analysis_box.height) + gap
+    definition_box.height = max(int(definition_box.height), definition_height)
+
+
 def _fit_word_name(shape) -> None:
     if shape is None or not hasattr(shape, "text_frame"):
         return
@@ -544,6 +860,184 @@ def _fit_word_name(shape) -> None:
         shape.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     except Exception:
         pass
+
+
+def _new_sound_action_button_xml(
+    *,
+    shape_id: int,
+    shape_name: str,
+    audio_rid: str,
+    audio_name: str,
+    label: str,
+    accent_rgb: Tuple[int, int, int],
+    x: int,
+    y: int,
+    cx: int,
+    cy: int,
+):
+    accent_hex = "%02X%02X%02X" % tuple(int(v) for v in accent_rgb)
+    return parse_xml(
+        (
+            "<p:sp %s>\n"
+            "  <p:nvSpPr>\n"
+            '    <p:cNvPr id="%d" name="%s">\n'
+            '      <a:hlinkClick action="ppaction://noaction">\n'
+            '        <a:snd r:embed="%s" name="%s"/>\n'
+            "      </a:hlinkClick>\n"
+            "    </p:cNvPr>\n"
+            "    <p:cNvSpPr/>\n"
+            "    <p:nvPr/>\n"
+            "  </p:nvSpPr>\n"
+            "  <p:spPr>\n"
+            "    <a:xfrm>\n"
+            '      <a:off x="%d" y="%d"/>\n'
+            '      <a:ext cx="%d" cy="%d"/>\n'
+            "    </a:xfrm>\n"
+            '    <a:prstGeom prst="roundRect">\n'
+            "      <a:avLst/>\n"
+            "    </a:prstGeom>\n"
+            "    <a:solidFill>\n"
+            '      <a:srgbClr val="%s"/>\n'
+            "    </a:solidFill>\n"
+            '    <a:ln w="25400">\n'
+            "      <a:solidFill>\n"
+            '        <a:srgbClr val="FFFFFF"/>\n'
+            "      </a:solidFill>\n"
+            "    </a:ln>\n"
+            "  </p:spPr>\n"
+            "  <p:style>\n"
+            "    <a:lnRef idx=\"2\"><a:schemeClr val=\"accent1\"/></a:lnRef>\n"
+            "    <a:fillRef idx=\"1\"><a:schemeClr val=\"accent1\"/></a:fillRef>\n"
+            "    <a:effectRef idx=\"0\"><a:schemeClr val=\"accent1\"/></a:effectRef>\n"
+            "    <a:fontRef idx=\"minor\"><a:schemeClr val=\"lt1\"/></a:fontRef>\n"
+            "  </p:style>\n"
+            "  <p:txBody>\n"
+            '    <a:bodyPr wrap="none" anchor="ctr">\n'
+            "      <a:spAutoFit/>\n"
+            "    </a:bodyPr>\n"
+            "    <a:lstStyle/>\n"
+            '    <a:p>\n'
+            '      <a:pPr algn="ctr"/>\n'
+            '      <a:r>\n'
+            '        <a:rPr lang="zh-CN" sz="3400" b="1">\n'
+            '          <a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>\n'
+            '          <a:latin typeface="Microsoft YaHei"/>\n'
+            '          <a:ea typeface="Microsoft YaHei"/>\n'
+            "        </a:rPr>\n"
+            "        <a:t>%s</a:t>\n"
+            "      </a:r>\n"
+            "    </a:p>\n"
+            "  </p:txBody>\n"
+            "</p:sp>\n"
+        )
+        % (
+            nsdecls("a", "p", "r"),
+            int(shape_id),
+            escape(shape_name),
+            audio_rid,
+            escape(audio_name),
+            int(x),
+            int(y),
+            int(cx),
+            int(cy),
+            accent_hex,
+            escape(label),
+        )
+    )
+
+
+def _add_embedded_audio_button(
+    *,
+    slide,
+    audio_path: Path,
+    label: str,
+    accent_rgb: Tuple[int, int, int],
+    x: int,
+    y: int,
+    cx: int,
+    cy: int,
+    shape_name: str,
+) -> None:
+    mime_type = "audio/mpeg" if audio_path.suffix.lower() == ".mp3" else "audio/wav"
+    media = Video.from_path_or_file_like(str(audio_path), mime_type)
+    media_part = slide.part._package.get_or_add_media_part(media)
+    audio_rid = slide.part.relate_to(media_part, RT.AUDIO)
+
+    shape_id = int(slide.shapes._next_shape_id)
+    button = _new_sound_action_button_xml(
+        shape_id=shape_id,
+        shape_name=shape_name,
+        audio_rid=audio_rid,
+        audio_name=audio_path.name,
+        label=label,
+        accent_rgb=accent_rgb,
+        x=int(x),
+        y=int(y),
+        cx=int(cx),
+        cy=int(cy),
+    )
+    slide.shapes._spTree.append(button)
+
+
+def _add_pronunciation_buttons(
+    *,
+    slide,
+    word: str,
+    word_shape,
+    card_shape,
+    audio_cache_dir: Path,
+    warnings: set[str],
+) -> None:
+    if word_shape is None:
+        return
+
+    available: List[Tuple[Dict[str, object], Path]] = []
+    for variant in AUDIO_VARIANTS:
+        audio_path = _get_word_audio(
+            word=word,
+            variant=variant,
+            cache_dir=audio_cache_dir,
+            warnings=warnings,
+        )
+        if audio_path is not None:
+            available.append((variant, audio_path))
+    if not available:
+        return
+
+    btn_w = 650000
+    btn_h = 650000
+    gap = 260000
+    total_w = len(available) * btn_w + max(0, len(available) - 1) * gap
+    margin = 330000
+
+    if card_shape is not None:
+        right_limit = int(card_shape.left) + int(card_shape.width) - margin
+        top_limit = int(card_shape.top) + 180000
+    else:
+        right_limit = int(word_shape.left) + int(word_shape.width)
+        top_limit = max(0, int(word_shape.top) - btn_h - gap)
+
+    word_font = _get_run_font_pt(word_shape, fallback=68.0)
+    word_end = int(word_shape.left) + _estimate_text_width_emu(word, font_pt=word_font)
+    x = max(int(word_shape.left), right_limit - total_w)
+    y = int(word_shape.top) + 120000
+
+    # If a long word reaches the button area, lift the buttons into the card's upper margin.
+    if word_end + 140000 > x:
+        y = max(top_limit, int(word_shape.top) - btn_h - gap)
+
+    for idx, (variant, audio_path) in enumerate(available):
+        _add_embedded_audio_button(
+            slide=slide,
+            audio_path=audio_path,
+            label=str(variant["label"]),
+            accent_rgb=tuple(variant["accent_rgb"]),  # type: ignore[arg-type]
+            x=x + idx * (btn_w + gap),
+            y=y,
+            cx=btn_w,
+            cy=btn_h,
+            shape_name=f"PRON_{str(variant['key']).upper()}_{word}",
+        )
 
 
 def _set_paragraph_font_size(shape, paragraph_index: int, font_pt: float) -> None:
@@ -726,7 +1220,14 @@ def _copy_slide_with_rels(*, src_prs: Presentation, dst_prs: Presentation, slide
     return new_slide
 
 
-def build_high_fidelity_ppt(*, template_path: Path, content_path: Path, output_path: Path) -> Path:
+def build_high_fidelity_ppt(
+    *,
+    template_path: Path,
+    content_path: Path,
+    output_path: Path,
+    enable_audio: bool = True,
+    audio_cache_dir: Optional[Path] = None,
+) -> Path:
     material = parse_content_to_tree(content_path.read_text(encoding="utf-8"))
     # 调试输出：打印解析后的树状 JSON，便于核对每个单词是否被解析为独立 Detail 节点
     print("[parse_content_to_tree] JSON:")
@@ -734,6 +1235,8 @@ def build_high_fidelity_ppt(*, template_path: Path, content_path: Path, output_p
 
     meanings = material.meanings
     n_meanings = len(meanings)
+    audio_cache_dir = audio_cache_dir or (content_path.parent / AUDIO_CACHE_DIR)
+    audio_warnings: set[str] = set()
 
     # 源模板（只读）
     src = Presentation(str(template_path))
@@ -858,10 +1361,27 @@ def build_high_fidelity_ppt(*, template_path: Path, content_path: Path, output_p
             _set_shape_text_color(word_name, RGBColor(255, 0, 0))
             _fit_word_name(word_name)
             _set_text_wrap(phonetic_box, wrap=False)
-            _fit_text_box_inside_card(definition_box, w.definition, preferred_font_pt=36.0, min_font_pt=30.0)
 
             card = _find_word_card_container(slide_word, [word_name, phonetic_box, definition_box, analysis_box])
-            _fit_text_box_inside_card(analysis_box, w.analysis, card_shape=card, min_font_pt=16.0)
+            _arrange_word_detail_text_blocks(
+                word_shape=word_name,
+                phonetic_box=phonetic_box,
+                definition_box=definition_box,
+                analysis_box=analysis_box,
+                card_shape=card,
+            )
+            _fit_text_box_inside_card(analysis_box, w.analysis, min_font_pt=16.0)
+            _fit_text_box_inside_card(definition_box, w.definition, preferred_font_pt=36.0, min_font_pt=30.0)
+            _set_shape_text_color(definition_box, RGBColor(255, 0, 0))
+            if enable_audio:
+                _add_pronunciation_buttons(
+                    slide=slide_word,
+                    word=w.word,
+                    word_shape=word_name,
+                    card_shape=card,
+                    audio_cache_dir=audio_cache_dir,
+                    warnings=audio_warnings,
+                )
 
             # AI 图片提示词（仅打印，不创建 shape）
             if find_shape_by_name(slide_word, "PLACEHOLDER_AI_IMAGE") is not None:
@@ -960,6 +1480,9 @@ def build_high_fidelity_ppt(*, template_path: Path, content_path: Path, output_p
                 )
                 current_row_h = max(current_row_h, int(card.height))
 
+    for warning in sorted(audio_warnings):
+        print(f"[pronunciation] {warning}")
+
     # 保存（避免被 PowerPoint 锁）
     candidates: List[Path] = [output_path]
     candidates.append(output_path.with_name(f"{output_path.stem}_alt{output_path.suffix}"))
@@ -987,6 +1510,12 @@ if __name__ == "__main__":
     parser.add_argument("--content", default=str(base / CONTENT_TXT), help="Path to content.txt")
     parser.add_argument("--docx", default=None, help="Optional path to source .docx; when set, auto-extract to content")
     parser.add_argument("--output", default=None, help="Optional output .pptx path")
+    parser.add_argument("--no-audio", action="store_true", help="Disable pronunciation audio buttons")
+    parser.add_argument(
+        "--audio-cache",
+        default=None,
+        help="Optional directory for generated pronunciation wav cache",
+    )
     args = parser.parse_args()
 
     tpl = Path(args.template)
@@ -1006,6 +1535,12 @@ if __name__ == "__main__":
     else:
         output_path = base / OUTPUT_DEFAULT
 
-    out = build_high_fidelity_ppt(template_path=tpl, content_path=content, output_path=output_path)
+    out = build_high_fidelity_ppt(
+        template_path=tpl,
+        content_path=content,
+        output_path=output_path,
+        enable_audio=not args.no_audio,
+        audio_cache_dir=Path(args.audio_cache) if args.audio_cache else None,
+    )
     print(f"已生成：{out.resolve()}")
 
