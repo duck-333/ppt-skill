@@ -30,6 +30,10 @@ out/
 logs/
 *.log
 audio_cache/
+.tools/
+outputs/
+*.slides.json
+*.inspect.ndjson
 
 # OCR / binary extraction intermediates
 carved/
